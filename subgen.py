@@ -1,4 +1,4 @@
-subgen_version = '2024.3.25.63'
+subgen_version = '2024.3.25.62'
 
 from datetime import datetime
 import subprocess
@@ -6,6 +6,7 @@ import os
 import json
 import xml.etree.ElementTree as ET
 import threading
+from threading import Semaphore
 import sys
 import time
 import queue
@@ -100,6 +101,9 @@ def update_env_variables():
 
 update_env_variables()
 
+# Create a semaphore with the maximum number of concurrent transcriptions
+semaphore = Semaphore(concurrent_transcriptions)
+
 if monitor:
     from watchdog.observers.polling import PollingObserver as Observer
     from watchdog.events import FileSystemEventHandler
@@ -107,6 +111,7 @@ if monitor:
 app = FastAPI()
 model = None
 files_to_transcribe = []
+transcription_queue = queue.PriorityQueue()
 subextension =  f".subgen.{whisper_model.split('.')[0]}.{namesublang}.srt"
 subextensionSDH =  f".subgen.{whisper_model.split('.')[0]}.{namesublang}.sdh.srt"
 
@@ -353,7 +358,7 @@ def receive_tautulli_webhook(
             fullpath = file
             logging.debug("Path of file: " + fullpath)
         
-            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
     else:
         return {"This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"}
     
@@ -374,7 +379,7 @@ def receive_plex_webhook(
             fullpath = get_plex_file_name(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
             logging.debug("Path of file: " + fullpath)
      
-            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
             try:
                 refresh_plex_metadata(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
                 logging.info(f"Metadata for item {plex_json['Metadata']['ratingKey']} refreshed successfully.")
@@ -400,7 +405,7 @@ def receive_jellyfin_webhook(
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
             logging.debug(f"Path of file: {fullpath}")
      
-            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
             try:
                 refresh_jellyfin_metadata(ItemId, jellyfinserver, jellyfintoken)
                 logging.info(f"Metadata for item {ItemId} refreshed successfully.")
@@ -427,7 +432,7 @@ def receive_emby_webhook(
             if((event == "library.new" and procaddedmedia) or (event == "playback.start" and procmediaonplay)):
                 logging.debug("Path of file: " + fullpath)
      
-                gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
+                add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
     else:
         return {"This doesn't appear to be a properly configured Emby webhook, please review the instructions again!"}
      
@@ -443,7 +448,7 @@ def batch(
 # idea and some code for asr and detect language from https://github.com/ahmetoner/whisper-asr-webservice
 @app.post("//asr")
 @app.post("/asr")
-def asr(
+async def asr(
         task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
         language: Union[str, None] = Query(default=None),
         initial_prompt: Union[str, None] = Query(default=None),  #not used by Bazarr
@@ -453,30 +458,35 @@ def asr(
         word_timestamps: bool = Query(default=False, description="Word level timestamps") #not used by Bazarr
 ):
     try:
-        logging.info(f"Transcribing file from Bazarr/ASR webhook")
+        logging.debug(f"Received file from Bazarr/ASR webhook")
         result = None
-        random_name = random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6)
+        #random_name = random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6)
         
-        start_time = time.time()
-        start_model()
-        files_to_transcribe.insert(0, f"Bazarr-asr-{random_name}")
+        #start_time = time.time()
+        #start_model()
+        #files_to_transcribe.insert(0, f"Bazarr-asr-{random_name}")
+        
+        
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        if model_prompt:
-            custom_model_prompt = greetings_translations.get(language, '') or custom_model_prompt
-        if custom_regroup:
-            result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-        else:
-            result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
-        appendLine(result)
-        elapsed_time = time.time() - start_time
-        minutes, seconds = divmod(int(elapsed_time), 60)
-        logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+        
+        result = await add_to_queue(file_path=audio_data, transcribe_or_translate=task, forceLanguage=language, bazarr=True, priority=1)
+        
+        #if model_prompt:
+        #    custom_model_prompt = greetings_translations.get(language, '') or custom_model_prompt
+        #if custom_regroup:
+        #    result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
+        #else:
+        #    result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
+        #appendLine(result)
+        #elapsed_time = time.time() - start_time
+        #minutes, seconds = divmod(int(elapsed_time), 60)
+        #logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
     except Exception as e:
         logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
-    finally:
-        if f"Bazarr-asr-{random_name}" in files_to_transcribe:
-            files_to_transcribe.remove(f"Bazarr-asr-{random_name}")
-        delete_model()
+    #finally:
+        #if f"Bazarr-asr-{random_name}" in files_to_transcribe:
+            #files_to_transcribe.remove(f"Bazarr-asr-{random_name}")
+        #delete_model()
     if result:
         return StreamingResponse(
             iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
@@ -503,13 +513,8 @@ def detect_language(
             
     except Exception as e:
         logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
-        
-    finally:
-        if f"Bazarr-detect-language-{random_name}" in files_to_transcribe:
-            files_to_transcribe.remove(f"Bazarr-detect-language-{random_name}")
-        delete_model()
 
-        return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code) , "language_code": detected_lang_code}
+    return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code) , "language_code": detected_lang_code}
 
 def start_model():
     global model
@@ -534,6 +539,63 @@ def write_lrc(result, file_path):
             minutes, seconds = divmod(int(segment.start), 60)
             fraction = int((segment.start - int(segment.start)) * 100)
             file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}] {segment.text}\n")
+
+def worker():
+    while True:
+        # Get the next task from the priority queue
+        priority, file_path, transcribe_or_translate, forceLanguage, bazarr = transcription_queue.get()
+        try:
+            with semaphore:
+                start_time = time.time()
+                if bazarr:
+                    gen_subtitles_asr(file_path, transcribe_or_translate, forceLanguage=forceLanguage)
+                else:
+                    gen_subtitles(file_path, transcribe_or_translate, forceLanguage=forceLanguage)
+                elapsed_time = time.time() - start_time
+                minutes, seconds = divmod(int(elapsed_time), 60)
+                if not bazarr:
+                    logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+                else:
+                    logging.info(f"Transcription of Bazarr/ASR is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+        finally:
+            # Signal that the task is done
+            transcription_queue.task_done()
+            logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
+
+def add_to_queue(file_path, transcribe_or_translate, forceLanguage, bazarr=False, priority=2):
+    # Create a task tuple with all the necessary information
+    task = (priority, file_path, transcribe_or_translate, forceLanguage, bazarr)
+    
+    # Add the task tuple to the queue with the given priority
+    if not bazarr:
+        logging.info(f"Added {os.path.basename(file_path)} for transcription.")
+    else:
+        logging.info(f"Added Bazarr/ASR for transcription.")
+    transcription_queue.put(task)  # Pass the entire task as a single tuple
+    logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
+
+async def gen_subtitles_asr(audio, transcribe_or_translate: str, forceLanguage=None):
+    """Generates subtitles for a video file.
+
+    Args:
+        audio: The audio provided
+        transcribe_or_translate: str - The type of transcription or translation to perform.
+        forceLanguage: str - The language to force for transcription or translation. Default is None.
+    """
+    try:
+        start_model()
+        if custom_regroup:
+            result = await model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
+        else:
+            result = await model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt)
+
+        appendLine(result)
+    except Exception as e:
+        logging.info(f"Error processing or transcribing {file_path}: {e}")
+    finally:
+        delete_model()
+        return result
+
 
 def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forceLanguage=None) -> None:
     """Generates subtitles for a video file.
@@ -562,16 +624,9 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
                 logging.info(message)
                 return message
                 
-            if front:
-                files_to_transcribe.insert(0, file_path)
-            else:
-                files_to_transcribe.append(file_path)
-            logging.info(f"Added {os.path.basename(file_path)} for transcription.")
-            # Start transcription for the file in a separate thread
+            files_to_transcribe.append(file_path)
 
-            logging.info(f"{len(files_to_transcribe)} files in the queue for transcription")
             logging.info(f"Transcribing file: {os.path.basename(file_path)}")
-            start_time = time.time()
             start_model()
             global force_detected_language_to
             if force_detected_language_to:
@@ -587,9 +642,6 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
                 write_lrc(result, file_name + '.lrc')
             else:
                 result.to_srt_vtt(file_name + subextension, word_level=word_level_highlight)
-            elapsed_time = time.time() - start_time
-            minutes, seconds = divmod(int(elapsed_time), 60)
-            logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
         else:
             logging.info(f"File {os.path.basename(file_path)} is already in the transcription list. Skipping.")
 
@@ -599,7 +651,7 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
         if file_path in files_to_transcribe:
             files_to_transcribe.remove(file_path)
         delete_model()
-
+        
 def get_file_name_without_extension(file_path):
     file_name, file_extension = os.path.splitext(file_path)
     return file_name
@@ -770,7 +822,7 @@ if monitor:
                 if has_audio(file_path):
                 # Call the gen_subtitles function
                     logging.info(f"File: {path_mapping(file_path)} was added")
-                    gen_subtitles(path_mapping(file_path), transcribe_or_translate, False)
+                    add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
         def on_created(self, event):
             self.create_subtitle(event)
         def on_modified(self, event):
@@ -785,11 +837,11 @@ def transcribe_existing(transcribe_folders, forceLanguage=None):
         for root, dirs, files in os.walk(path):
             for file in files:
                 file_path = os.path.join(root, file)
-                gen_subtitles(path_mapping(file_path), transcribe_or_translate, False, forceLanguage)
+                add_to_queue(path_mapping(file_path), transcribe_or_translate, forceLanguage=forceLanguage)
     # if the path specified was actually a single file and not a folder, process it
     if os.path.isfile(path):
         if has_audio(path):
-            gen_subtitles(path_mapping(path), transcribe_or_translate, False, forceLanguage) 
+            add_to_queue(path_mapping(path), transcribe_or_translate, forceLanguage=forceLanguage)
      # Set up the observer to watch for new files
     if monitor:
         observer = Observer()
@@ -1041,6 +1093,12 @@ env_variables = {
 if __name__ == "__main__":
     import uvicorn
     update_env_variables()
+    
+    for _ in range(concurrent_transcriptions):
+        thread = threading.Thread(target=worker)
+        thread.daemon = True  # Daemon threads will shut down when the main thread exits
+        thread.start()
+    
     logging.info(f"Subgen v{subgen_version}")
     logging.info("Starting Subgen with listening webhooks!")
     logging.info(f"Transcriptions are limited to running {str(concurrent_transcriptions)} at a time")
