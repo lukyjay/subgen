@@ -1,34 +1,37 @@
 subgen_version = '2024.3.26.65'
 
-from datetime import datetime
-import subprocess
-import os
+import gc
 import json
-import xml.etree.ElementTree as ET
-import threading
-from threading import Semaphore, Thread
+import logging
+import os
+import random
+import re
 import sys
 import time
-import queue
-import logging
-import gc
-import io
-import random
-from typing import BinaryIO, Union, Any
-from fastapi import FastAPI, File, UploadFile, Query, Header, Body, Form, Request
-from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
-import numpy as np
-import stable_whisper
-from stable_whisper import Segment
-import requests
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from queue import PriorityQueue
+from threading import Semaphore, Thread
+from typing import Union
+
 import av
-import ffmpeg
+import numpy as np
+import requests
+import stable_whisper
 import whisper
-import re
+from fastapi import FastAPI, File, UploadFile, Query, Header, Body, Form, Request
+from fastapi.responses import StreamingResponse, HTMLResponse
+from stable_whisper import Segment
+from concurrent.futures import Future
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+
 
 def convert_to_bool(in_bool):
     # Convert the input to string and lower case, then check against true values
     return str(in_bool).lower() in ('true', 'on', '1', 'y', 'yes')
+
 
 # Function to read environment variables from a file and return them as a dictionary
 def get_env_variables_from_file(filename):
@@ -42,7 +45,8 @@ def get_env_variables_from_file(filename):
     except FileNotFoundError:
         print(f"File {filename} not found. Using default values.")
     return env_vars
-    
+
+
 def set_env_variables(filename):
     try:
         with open(filename, 'r') as file:
@@ -53,6 +57,7 @@ def set_env_variables(filename):
     except FileNotFoundError:
         print(f"File {filename} not found. Environment variables not set.")
 
+
 def update_env_variables():
     global plextoken, plexserver, jellyfintoken, jellyfinserver, whisper_model, whisper_threads
     global concurrent_transcriptions, transcribe_device, procaddedmedia, procmediaonplay
@@ -61,12 +66,12 @@ def update_env_variables():
     global transcribe_folders, transcribe_or_translate, force_detected_language_to
     global clear_vram_on_complete, compute_type, append, reload_script_on_change
     global model_prompt, custom_model_prompt, lrc_for_audio_files, custom_regroup
-    
+
     plextoken = os.getenv('PLEXTOKEN', 'token here')
     plexserver = os.getenv('PLEXSERVER', 'http://192.168.1.111:32400')
     jellyfintoken = os.getenv('JELLYFINTOKEN', 'token here')
     jellyfinserver = os.getenv('JELLYFINSERVER', 'http://192.168.1.111:8096')
-    whisper_model = os.getenv('WHISPER_MODEL', 'medium')
+    whisper_model = os.getenv('WHISPER_MODEL', 'tiny')
     whisper_threads = int(os.getenv('WHISPER_THREADS', 4))
     concurrent_transcriptions = int(os.getenv('CONCURRENT_TRANSCRIPTIONS', 2))
     transcribe_device = os.getenv('TRANSCRIBE_DEVICE', 'cpu')
@@ -81,7 +86,7 @@ def update_env_variables():
     path_mapping_from = os.getenv('PATH_MAPPING_FROM', r'/tv')
     path_mapping_to = os.getenv('PATH_MAPPING_TO', r'/Volumes/TV')
     model_location = os.getenv('MODEL_PATH', './models')
-    monitor = convert_to_bool(os.getenv('MONITOR', False))
+    monitor = convert_to_bool(os.getenv('MONITOR', True))
     transcribe_folders = os.getenv('TRANSCRIBE_FOLDERS', '')
     transcribe_or_translate = os.getenv('TRANSCRIBE_OR_TRANSLATE', 'transcribe')
     force_detected_language_to = os.getenv('FORCE_DETECTED_LANGUAGE_TO', '')
@@ -95,29 +100,32 @@ def update_env_variables():
     custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
 
     set_env_variables('subgen.env')
-    
+
     if transcribe_device == "gpu":
         transcribe_device = "cuda"
 
-update_env_variables()
 
-# Create a semaphore with the maximum number of concurrent transcriptions
-semaphore = Semaphore(concurrent_transcriptions)
+update_env_variables()
 
 if monitor:
     from watchdog.observers.polling import PollingObserver as Observer
     from watchdog.events import FileSystemEventHandler
 
+CONCURRENT_TASKS = 2
+semaphore = Semaphore(CONCURRENT_TASKS)
+# Priority queue to hold tasks with different priorities
+task_queue = PriorityQueue()
+
 app = FastAPI()
 model = None
 files_to_transcribe = []
-transcription_queue = queue.PriorityQueue()
-subextension =  f".subgen.{whisper_model.split('.')[0]}.{namesublang}.srt"
-subextensionSDH =  f".subgen.{whisper_model.split('.')[0]}.{namesublang}.sdh.srt"
+subextension = f".subgen.{whisper_model.split('.')[0]}.{namesublang}.srt"
+subextensionSDH = f".subgen.{whisper_model.split('.')[0]}.{namesublang}.sdh.srt"
 
 in_docker = os.path.exists('/.dockerenv')
 docker_status = "Docker" if in_docker else "Standalone"
 last_print_time = None
+
 
 # Define a filter class
 class MultiplePatternsFilter(logging.Filter):
@@ -141,6 +149,7 @@ class MultiplePatternsFilter(logging.Filter):
         # Return False if any of the patterns are found, True otherwise
         return not any(pattern in record.getMessage() for pattern in patterns)
 
+
 # Configure logging
 if debug:
     level = logging.DEBUG
@@ -161,15 +170,16 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 
-#This forces a flush to print progress correctly
+
+# This forces a flush to print progress correctly
 def progress(seek, total):
     sys.stdout.flush()
     sys.stderr.flush()
-    if(docker_status) == 'Docker':
+    if (docker_status) == 'Docker':
         global last_print_time
         # Get the current time
         current_time = time.time()
-    
+
         # Check if 5 seconds have passed since the last print
         if last_print_time is None or (current_time - last_print_time) >= 5:
             # Update the last print time
@@ -177,14 +187,16 @@ def progress(seek, total):
             # Log the message
             logging.info("Force Update...")
 
+
 TIME_OFFSET = 5
+
 
 def appendLine(result):
     if append:
         lastSegment = result.segments[-1]
         date_time_str = datetime.now().strftime("%d %b %Y - %H:%M:%S")
         appended_text = f"Transcribed by whisperAI with faster-whisper ({whisper_model}) on {date_time_str}"
-        
+
         # Create a new segment with the updated information
         newSegment = Segment(
             start=lastSegment.start + TIME_OFFSET,
@@ -193,9 +205,10 @@ def appendLine(result):
             words=[],  # Empty list for words
             id=lastSegment.id + 1
         )
-        
+
         # Append the new segment to the result's segments
         result.segments.append(newSegment)
+
 
 @app.get("/plex")
 @app.get("/webhook")
@@ -205,7 +218,9 @@ def appendLine(result):
 @app.get("/detect-language")
 @app.get("/tautulli")
 def handle_get_request(request: Request):
-    return {"You accessed this request incorrectly via a GET request.  See https://github.com/McCloudS/subgen for proper configuration"}
+    return {
+        "You accessed this request incorrectly via a GET request.  See https://github.com/McCloudS/subgen for proper configuration"}
+
 
 # Function to generate HTML form with values filled from the environment file
 @app.get("/", response_class=HTMLResponse)
@@ -215,9 +230,11 @@ def form_get():
     html_content = "<html><head><title>Subgen settings!</title></head><body>"
     html_content += '<img src="https://raw.githubusercontent.com/McCloudS/subgen/main/icon.png" alt="Header Image" style="display: block; margin-left: auto; margin-right: auto; width: 10%;">'
     html_content += "<html><body><form action=\"/submit\" method=\"post\">"
-    
+
     for var_name, var_info in env_variables.items():
-        value = os.getenv(var_name, env_values.get(var_name, var_info['default'])) if not isinstance(var_info['default'], bool) else convert_to_bool(os.getenv(var_name, env_values.get(var_name, var_info['default'])))
+        value = os.getenv(var_name, env_values.get(var_name, var_info['default'])) if not isinstance(
+            var_info['default'], bool) else convert_to_bool(
+            os.getenv(var_name, env_values.get(var_name, var_info['default'])))
         # Generate the HTML content
         html_content += f"<br><div><strong>{var_name}</strong>: {var_info['description']} (<strong>default: {var_info['default']}</strong>)<br>"
         if var_name == "TRANSCRIBE_OR_TRANSLATE":
@@ -262,7 +279,8 @@ async def form_post(request: Request):
             # Normalize the key to uppercase
             key = key.upper()
             # Convert the value to the correct type (boolean or string)
-            value = value.strip() if not isinstance(env_variables[key]["default"], bool) else convert_to_bool(value.strip())
+            value = value.strip() if not isinstance(env_variables[key]["default"], bool) else convert_to_bool(
+                value.strip())
             # Retrieve the current environment variable value
             env_value = os.getenv(key)
             if key in os.environ:
@@ -281,11 +299,14 @@ async def form_post(request: Request):
     update_env_variables()
     return f"Configuration saved to {env_path}, reloading your subgen with your new values!"
 
+
 @app.get("/status")
 def status():
     in_docker = os.path.exists('/.dockerenv')
     docker_status = "Docker" if in_docker else "Standalone"
-    return {"version" : f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, whisper {whisper.__version__} ({docker_status})"}
+    return {
+        "version": f"Subgen {subgen_version}, stable-ts {stable_whisper.__version__}, whisper {whisper.__version__} ({docker_status})"}
+
 
 @app.post("/subsync")
 def subsync(
@@ -296,7 +317,7 @@ def subsync(
     try:
         logging.info(f"Syncing subtitle file from Subsync webhook")
         result = None
-        
+
         srt_content = subtitle_file.file.read().decode('utf-8')
         srt_content = re.sub(r'\{.*?\}', '', srt_content)
         # Remove numeric counters for each entry
@@ -305,7 +326,7 @@ def subsync(
         srt_content = re.sub(r'\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}', '', srt_content)
         # Remove any remaining newlines and spaces
         srt_content = re.sub(r'\n\n+', '\n', srt_content).strip()
-                
+
         start_time = time.time()
         start_model()
 
@@ -320,7 +341,7 @@ def subsync(
         delete_model()
     if result:
         return StreamingResponse(
-            iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
+            iter(result.to_srt_vtt(filepath=None, word_level=word_level_highlight)),
             media_type="text/plain",
             headers={
                 'Source': 'Aligned using stable-ts from Subgen!',
@@ -328,41 +349,43 @@ def subsync(
     else:
         return
 
+
 @app.post("/tautulli")
 def receive_tautulli_webhook(
-    source: Union[str, None] = Header(None), 
-    event: str = Body(None),
-    file: str = Body(None),
-    ):
-    
+        source: Union[str, None] = Header(None),
+        event: str = Body(None),
+        file: str = Body(None),
+):
     if source == "Tautulli":
         logging.debug(f"Tautulli event detected is: {event}")
-        if((event == "added" and procaddedmedia) or (event == "played" and procmediaonplay)):
+        if ((event == "added" and procaddedmedia) or (event == "played" and procmediaonplay)):
             fullpath = file
             logging.debug("Path of file: " + fullpath)
-        
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
+
+            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
     else:
-        return {"This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"}
-    
+        return {
+            "This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"}
+
     return ""
-    
+
+
 @app.post("/plex")
 def receive_plex_webhook(
-    user_agent: Union[str, None] = Header(None), 
-    payload: Union[str, None] = Form(),
-    ):
+        user_agent: Union[str, None] = Header(None),
+        payload: Union[str, None] = Form(),
+):
     plex_json = json.loads(payload)
     logging.debug(f"Raw response: {payload}")
-    
+
     if "PlexMediaServer" in user_agent:
         event = plex_json["event"]
         logging.debug(f"Plex event detected is: {event}")
-        if((event == "library.new" and procaddedmedia) or (event == "media.play" and procmediaonplay)):
+        if ((event == "library.new" and procaddedmedia) or (event == "media.play" and procmediaonplay)):
             fullpath = get_plex_file_name(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
             logging.debug("Path of file: " + fullpath)
-     
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
+
+            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
             try:
                 refresh_plex_metadata(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
                 logging.info(f"Metadata for item {plex_json['Metadata']['ratingKey']} refreshed successfully.")
@@ -370,131 +393,287 @@ def receive_plex_webhook(
                 logging.error(f"Failed to refresh metadata for item {plex_json['Metadata']['ratingKey']}: {e}")
     else:
         return {"This doesn't appear to be a properly configured Plex webhook, please review the instructions again!"}
-     
+
     return ""
+
 
 @app.post("/jellyfin")
 def receive_jellyfin_webhook(
-    user_agent: Union[str, None] = Header(None), 
-    NotificationType: str = Body(None),
-    file: str = Body(None),
-    ItemId: str = Body(None),
-    ):
-    
+        user_agent: Union[str, None] = Header(None),
+        NotificationType: str = Body(None),
+        file: str = Body(None),
+        ItemId: str = Body(None),
+):
     if "Jellyfin-Server" in user_agent:
         logging.debug("Jellyfin event detected is: " + NotificationType)
         logging.debug("itemid is: " + ItemId)
-        if((NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay)):
+        if ((NotificationType == "ItemAdded" and procaddedmedia) or (
+                NotificationType == "PlaybackStart" and procmediaonplay)):
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
             logging.debug(f"Path of file: {fullpath}")
-     
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
+
+            gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
             try:
                 refresh_jellyfin_metadata(ItemId, jellyfinserver, jellyfintoken)
                 logging.info(f"Metadata for item {ItemId} refreshed successfully.")
             except Exception as e:
                 logging.error(f"Failed to refresh metadata for item {ItemId}: {e}")
     else:
-        return {"This doesn't appear to be a properly configured Jellyfin webhook, please review the instructions again!"}
-     
+        return {
+            "This doesn't appear to be a properly configured Jellyfin webhook, please review the instructions again!"}
+
     return ""
+
 
 @app.post("/emby")
 def receive_emby_webhook(
-    user_agent: Union[str, None] = Header(None), 
-    data: Union[str, None] = Form(None),
-    ):
+        user_agent: Union[str, None] = Header(None),
+        data: Union[str, None] = Form(None),
+):
     logging.debug("Raw response: %s", data)
-    
+
     if "Emby Server" in user_agent:
         if data:
             data_dict = json.loads(data)
             fullpath = data_dict['Item']['Path']
             event = data_dict['Event']
             logging.debug("Emby event detected is: " + event)
-            if((event == "library.new" and procaddedmedia) or (event == "playback.start" and procmediaonplay)):
+            if ((event == "library.new" and procaddedmedia) or (event == "playback.start" and procmediaonplay)):
                 logging.debug("Path of file: " + fullpath)
-     
-                add_to_queue(path_mapping(fullpath), transcribe_or_translate)
+
+                gen_subtitles(path_mapping(fullpath), transcribe_or_translate, True)
     else:
         return {"This doesn't appear to be a properly configured Emby webhook, please review the instructions again!"}
-     
+
     return ""
-    
+
+
 @app.post("/batch")
 def batch(
         directory: Union[str, None] = Query(default=None),
         forceLanguage: Union[str, None] = Query(default=None)
 ):
     transcribe_existing(directory, forceLanguage)
-    
+
+
 # idea and some code for asr and detect language from https://github.com/ahmetoner/whisper-asr-webservice
 @app.post("//asr")
 @app.post("/asr")
 async def asr(
         task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
         language: Union[str, None] = Query(default=None),
-        initial_prompt: Union[str, None] = Query(default=None),  #not used by Bazarr
+        initial_prompt: Union[str, None] = Query(default=None),  # not used by Bazarr
         audio_file: UploadFile = File(...),
-        encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),  #not used by Bazarr/always False
+        encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),
+        # not used by Bazarr/always False
         output: Union[str, None] = Query(default="srt", enum=["txt", "vtt", "srt", "tsv", "json"]),
-        word_timestamps: bool = Query(default=False, description="Word level timestamps") #not used by Bazarr
+        word_timestamps: bool = Query(default=False, description="Word level timestamps")  # not used by Bazarr
 ):
     try:
+        future = asyncio.Future()
         logging.debug(f"Received file from Bazarr/ASR webhook")
         result = None
-        
+
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        
-        result_queue = add_to_queue(file_path=audio_data, transcribe_or_translate=task, forceLanguage=language, bazarr=True, priority=1)
-        result = result_queue.get()
+        task_queue.put((2, future, audio_data, task, language, True ))
+        result = await future
     except Exception as e:
         logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
 
     if result:
         return StreamingResponse(
-            iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
+            iter(result.to_srt_vtt(filepath=None, word_level=word_level_highlight)),
             media_type="text/plain",
             headers={
                 'Source': 'Transcribed using stable-ts from Subgen!',
             })
     else:
         return
-        
+
+
 @app.post("//detect-language")
 @app.post("/detect-language")
 def detect_language(
         audio_file: UploadFile = File(...),
-        #encode: bool = Query(default=True, description="Encode audio first through ffmpeg") # This is always false from Bazarr
-):    
+        # encode: bool = Query(default=True, description="Encode audio first through ffmpeg") # This is always false from Bazarr
+):
     detected_lang_code = ""  # Initialize with an empty string
     try:
         start_model()
+        random_name = random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6)
+        files_to_transcribe.insert(0, f"Bazarr-detect-language-{random_name}")
         audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
         detected_lang_code = model.transcribe_stable(whisper.pad_or_trim(audio_data), input_sr=16000).language
-            
+
     except Exception as e:
         logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
-        
+
     finally:
-        return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code) , "language_code": detected_lang_code}
+        if f"Bazarr-detect-language-{random_name}" in files_to_transcribe:
+            files_to_transcribe.remove(f"Bazarr-detect-language-{random_name}")
+        delete_model()
+
+        return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code),
+                "language_code": detected_lang_code}
+
+def new_gen_subtitles(audio, transcribe_or_translate: str, forceLanguage=None, bazarr=False, max_workers=3):
+    """Generates subtitles for a video file.
+
+    Args:
+        audio: The audio provided
+        transcribe_or_translate: str - The type of transcription or translation to perform.
+        forceLanguage: str - The language to force for transcription or translation. Default is None.
+    """
+    with semaphore:
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        try:
+            bazarr = isinstance(audio, np.ndarray)
+            start_model()
+            start_time = time.time()
+
+            if not bazarr:
+                if force_detected_language_to:
+                    forceLanguage = force_detected_language_to
+                    logging.info(f"Forcing language to {forceLanguage}")
+                message = None
+                if has_subtitle_language(audio, skipifinternalsublang):
+                    message = f"{audio} already has an internal subtitle we want, skipping generation"
+                elif os.path.exists(audio.rsplit('.', 1)[0] + subextension):
+                    message = f"{audio} already has a subtitle created for this, skipping it"
+                elif os.path.exists(audio.rsplit('.', 1)[0] + subextensionSDH):
+                    message = f"{audio} already has a SDH subtitle created for this, skipping it"
+                if message != None:
+                    logging.info(message)
+                    return message
+            logging.info(f"Transcribing {'Bazarr/ASR' if isinstance(audio, np.ndarray) else os.path.basename(audio)}")
+
+            if custom_regroup:
+                result = executor.submit(model.transcribe_stable, audio, language=forceLanguage, task=transcribe_or_translate, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup).result()
+            else:
+                result = executor.submit(model.transcribe_stable, audio, language=forceLanguage, task=transcribe_or_translate, progress_callback=progress, initial_prompt=custom_model_prompt).result()
+            appendLine(result)
+            elapsed_time = time.time() - start_time
+            minutes, seconds = divmod(int(elapsed_time), 60)
+
+            if not bazarr:
+                file_name, file_extension = os.path.splitext(audio)
+                if isAudioFileExtension(file_extension) and lrc_for_audio_files:
+                    write_lrc(result, file_name + '.lrc')
+                else:
+                    result.to_srt_vtt(file_name + subextension, word_level=word_level_highlight)
+
+
+            logging.info(f"Transcription of {'Bazarr/ASR' if isinstance(audio, np.ndarray) else os.path.basename(audio)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+        except Exception as e:
+            logging.info(f"Error processing or transcribing {'Bazarr/ASR' if isinstance(audio, np.ndarray) else os.path.basename(audio)}: {e}")
+        finally:
+            if bazarr:
+                return result
+def worker():
+    while True:
+        priority, future, file, transcribe_or_translate, forceLanguage = task_queue.get()
+        try:
+            logging.info(f"There are {task_queue.qsize()} items in the queue")
+            result = new_gen_subtitles(file, transcribe_or_translate, forceLanguage)
+            if isinstance(file, np.ndarray):
+                future.set_result(result)
+        finally:
+            task_queue.task_done()
+            logging.info(f"There are {task_queue.qsize()} items in the queue")
+
+
+
+def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forceLanguage=None) -> None:
+    """Generates subtitles for a video file.
+
+    Args:
+        file_path: str - The path to the video file.
+        transcribe_or_translate: str - The type of transcription or translation to perform.
+        front: bool - Whether to add the file to the front of the transcription queue. Default is True.
+        forceLanguage: str - The language to force for transcription or translation. Default is None.
+    """
+
+    try:
+        if not has_audio(file_path):
+            logging.debug(f"{file_path} doesn't have any audio to transcribe!")
+            return None
+
+        if file_path not in files_to_transcribe:
+            message = None
+            if has_subtitle_language(file_path, skipifinternalsublang):
+                message = f"{file_path} already has an internal subtitle we want, skipping generation"
+            elif os.path.exists(file_path.rsplit('.', 1)[0] + subextension):
+                message = f"{file_path} already has a subtitle created for this, skipping it"
+            elif os.path.exists(file_path.rsplit('.', 1)[0] + subextensionSDH):
+                message = f"{file_path} already has a SDH subtitle created for this, skipping it"
+            if message != None:
+                logging.info(message)
+                return message
+
+            if front:
+                files_to_transcribe.insert(0, file_path)
+            else:
+                files_to_transcribe.append(file_path)
+            logging.info(f"Added {os.path.basename(file_path)} for transcription.")
+            # Start transcription for the file in a separate thread
+
+            logging.info(f"{len(files_to_transcribe)} files in the queue for transcription")
+            logging.info(f"Transcribing file: {os.path.basename(file_path)}")
+            start_time = time.time()
+            start_model()
+            global force_detected_language_to
+            if force_detected_language_to:
+                forceLanguage = force_detected_language_to
+                logging.info(f"Forcing language to {forceLanguage}")
+            if custom_regroup:
+                result = model.transcribe_stable(file_path, language=forceLanguage, task=transcribe_or_translate,
+                                                 progress_callback=progress, initial_prompt=custom_model_prompt,
+                                                 regroup=custom_regroup)
+            else:
+                result = model.transcribe_stable(file_path, language=forceLanguage, task=transcribe_or_translate,
+                                                 progress_callback=progress, initial_prompt=custom_model_prompt)
+            appendLine(result)
+            file_name, file_extension = os.path.splitext(file_path)
+            if isAudioFileExtension(file_extension) and lrc_for_audio_files:
+                write_lrc(result, file_name + '.lrc')
+            else:
+                result.to_srt_vtt(file_name + subextension, word_level=word_level_highlight)
+            elapsed_time = time.time() - start_time
+            minutes, seconds = divmod(int(elapsed_time), 60)
+            logging.info(
+                f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+        else:
+            logging.info(f"File {os.path.basename(file_path)} is already in the transcription list. Skipping.")
+
+    except Exception as e:
+        logging.info(f"Error processing or transcribing {file_path}: {e}")
+    finally:
+        if file_path in files_to_transcribe:
+            files_to_transcribe.remove(file_path)
+        delete_model()
+
 
 def start_model():
     global model
     if model is None:
         logging.debug("Model was purged, need to re-create")
-        model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
+        model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location,
+                                                   device=transcribe_device, cpu_threads=whisper_threads,
+                                                   num_workers=concurrent_transcriptions, compute_type=compute_type)
+
 
 def delete_model():
-    if clear_vram_on_complete:
+    if clear_vram_on_complete and len(files_to_transcribe) == 0:
         global model
         logging.debug("Queue is empty, clearing/releasing VRAM")
         model = None
         gc.collect()
 
+
 def isAudioFileExtension(file_extension):
     return file_extension.casefold() in \
-        [ '.mp3', '.flac', '.wav', '.alac', '.ape', '.ogg', '.wma', '.m4a', '.m4b', '.aac', '.aiff' ]
+        ['.mp3', '.flac', '.wav', '.alac', '.ape', '.ogg', '.wma', '.m4a', '.m4b', '.aac', '.aiff']
+
 
 def write_lrc(result, file_path):
     with open(file_path, "w") as file:
@@ -503,154 +682,19 @@ def write_lrc(result, file_path):
             fraction = int((segment.start - int(segment.start)) * 100)
             file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}] {segment.text}\n")
 
-def worker():
-    while True:
-        # Get the next task from the priority queue
-        priority, file_path, transcribe_or_translate, forceLanguage, bazarr = transcription_queue.get()
-        try:
-            with semaphore:
-                start_time = time.time()
-                result_queue = add_to_queue(file_path, transcribe_or_translate, forceLanguage, bazarr, priority)
-                result = result_queue.get()  # This will block until the result is available
-                elapsed_time = time.time() - start_time
-                minutes, seconds = divmod(int(elapsed_time), 60)
-                if not bazarr:
-                    logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
-                else:
-                    logging.info(f"Transcription of Bazarr/ASR is completed, it took {minutes} minutes and {seconds} seconds to complete.")
-                    
-                # Signal that the task is done
-                transcription_queue.task_done()
-                
-                # Remove the task from the queue
-                transcription_queue.get()
-                if transcription_queue.qsize() == 0:
-                    delete_model()
-        finally:
-            # Signal that the task is done
-            logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
-            
-            
-            
-# Function to add a task to the transcription queue
-def add_to_queue(file_path, transcribe_or_translate, forceLanguage, bazarr=False, priority=2):
-    # Create a task tuple with all the necessary information
-    task = (priority, file_path, transcribe_or_translate, forceLanguage, bazarr)
-    result_queue = queue.Queue()
-    event = threading.Event()  # Event to signal completion of the task
-    
-    # Define a wrapper function to run the task and store the result
-    def task_wrapper():
-        try:
-            if bazarr:
-                result = gen_subtitles_asr(file_path, transcribe_or_translate, forceLanguage)
-            else:
-                if not has_audio(file_path):
-                    logging.debug(f"{file_path} doesn't have any audio to transcribe!")
-                    return
-            
-                if not any(task[1] == file_path for task in transcription_queue.queue):
-                    message = None
-                    if has_subtitle_language(file_path, skipifinternalsublang):
-                        message = f"{file_path} already has an internal subtitle we want, skipping generation"
-                    elif os.path.exists(file_path.rsplit('.', 1)[0] + subextension):
-                        message = f"{file_path} already has a subtitle created for this, skipping it"
-                    elif os.path.exists(file_path.rsplit('.', 1)[0] + subextensionSDH):
-                        message = f"{file_path} already has a SDH subtitle created for this, skipping it"
-                    if message != None:
-                        logging.info(message)
-                        return
-                else:
-                        logging.info(f"File {os.path.basename(file_path)} is already in the transcription queue. Skipping.")
-                        
-                result = gen_subtitles(file_path, transcribe_or_translate, forceLanguage)
-                
-            result_queue.put(result)
-        finally:
-            event.set()  # Signal that the task is completed
-    
-    # Start the task in a new thread
-    task_thread = threading.Thread(target=task_wrapper)
-    task_thread.start()
-    
-    # Wait for the task to complete
-    event.wait()
-    
-    # Add the task tuple to the queue with the given priority
-    if not bazarr:
-        logging.info(f"Added {os.path.basename(file_path)} for transcription.")
-    else:
-        logging.info(f"Added Bazarr/ASR for transcription.")
-    transcription_queue.put(task)  # Pass the entire task as a single tuple
-    logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
-    
-    return result_queue
-
-def gen_subtitles_asr(audio, transcribe_or_translate: str, forceLanguage=None):
-    """Generates subtitles for a video file.
-
-    Args:
-        audio: The audio provided
-        transcribe_or_translate: str - The type of transcription or translation to perform.
-        forceLanguage: str - The language to force for transcription or translation. Default is None.
-    """
-    try:
-        start_model()
-        if custom_regroup:
-            result = model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-        else:
-            result = model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt)
-
-        appendLine(result)
-    except Exception as e:
-        logging.info(f"Error processing or transcribing {file_path}: {e}")
-    finally:
-        return result
-
-
-def gen_subtitles(file_path: str, transcribe_or_translate: str, forceLanguage=None) -> None:
-    """Generates subtitles for a video file.
-
-    Args:
-        file_path: str - The path to the video file.
-        transcribe_or_translate: str - The type of transcription or translation to perform.
-        forceLanguage: str - The language to force for transcription or translation. Default is None.
-    """
-    
-    try:
-            start_model()
-            logging.info(f"Transcribing file: {os.path.basename(file_path)}")
-
-            global force_detected_language_to
-            if force_detected_language_to:
-                forceLanguage = force_detected_language_to
-                logging.info(f"Forcing language to {forceLanguage}")
-            if custom_regroup:
-                result = model.transcribe_stable(file_path, language=forceLanguage, task=transcribe_or_translate, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-            else:
-                result = model.transcribe_stable(file_path, language=forceLanguage, task=transcribe_or_translate, progress_callback=progress, initial_prompt=custom_model_prompt)
-            appendLine(result)
-            file_name, file_extension = os.path.splitext(file_path)
-            if isAudioFileExtension(file_extension) and lrc_for_audio_files:
-                write_lrc(result, file_name + '.lrc')
-            else:
-                result.to_srt_vtt(file_name + subextension, word_level=word_level_highlight)
-
-    except Exception as e:
-        logging.info(f"Error processing or transcribing {file_path}: {e}")
-    finally:
-        if file_path in files_to_transcribe:
-            files_to_transcribe.remove(file_path)
 
 def get_file_name_without_extension(file_path):
     file_name, file_extension = os.path.splitext(file_path)
     return file_name
 
+
 def has_subtitle_language(video_file, target_language):
     try:
         with av.open(video_file) as container:
-            subtitle_stream = next((stream for stream in container.streams if stream.type == 'subtitle' and 'language' in stream.metadata and stream.metadata['language'] == target_language), None)
-            
+            subtitle_stream = next((stream for stream in container.streams if
+                                    stream.type == 'subtitle' and 'language' in stream.metadata and stream.metadata[
+                                        'language'] == target_language), None)
+
             if subtitle_stream:
                 logging.debug(f"Subtitles in '{target_language}' language found in the video.")
                 return True
@@ -659,7 +703,8 @@ def has_subtitle_language(video_file, target_language):
     except Exception as e:
         logging.info(f"An error occurred: {e}")
         return False
-    
+
+
 def get_plex_file_name(itemid: str, server_ip: str, plex_token: str) -> str:
     """Gets the full path to a file from the Plex server.
 
@@ -687,15 +732,16 @@ def get_plex_file_name(itemid: str, server_ip: str, plex_token: str) -> str:
     else:
         raise Exception(f"Error: {response.status_code}")
 
+
 def refresh_plex_metadata(itemid: str, server_ip: str, plex_token: str) -> None:
     """
     Refreshes the metadata of a Plex library item.
-    
+
     Args:
         itemid: The ID of the item in the Plex library whose metadata needs to be refreshed.
         server_ip: The IP address of the Plex server.
         plex_token: The Plex token used for authentication.
-        
+
     Raises:
         Exception: If the server does not respond with a successful status code.
     """
@@ -717,15 +763,16 @@ def refresh_plex_metadata(itemid: str, server_ip: str, plex_token: str) -> None:
     else:
         raise Exception(f"Error refreshing metadata: {response.status_code}")
 
+
 def refresh_jellyfin_metadata(itemid: str, server_ip: str, jellyfin_token: str) -> None:
     """
     Refreshes the metadata of a Jellyfin library item.
-    
+
     Args:
         itemid: The ID of the item in the Jellyfin library whose metadata needs to be refreshed.
         server_ip: The IP address of the Jellyfin server.
         jellyfin_token: The Jellyfin token used for authentication.
-        
+
     Raises:
         Exception: If the server does not respond with a successful status code.
     """
@@ -782,12 +829,14 @@ def get_jellyfin_file_name(item_id: str, jellyfin_url: str, jellyfin_token: str)
     else:
         raise Exception(f"Error: {response.status_code}")
 
+
 def get_jellyfin_admin(users):
     for user in users:
         if user["Policy"]["IsAdministrator"]:
             return user["Id"]
-            
+
     raise Exception("Unable to find administrator user in Jellyfin")
+
 
 def has_audio(file_path):
     try:
@@ -796,11 +845,25 @@ def has_audio(file_path):
     except (av.AVError, UnicodeDecodeError):
         return False
 
+
 def path_mapping(fullpath):
     if use_path_mapping:
         logging.debug("Updated path: " + fullpath.replace(path_mapping_from, path_mapping_to))
         return fullpath.replace(path_mapping_from, path_mapping_to)
     return fullpath
+
+def needsubs(file_path):
+    message = None
+    if has_subtitle_language(file_path, skipifinternalsublang):
+        message = f"{file_path} already has an internal subtitle we want, skipping generation"
+    elif os.path.exists(file_path.rsplit('.', 1)[0] + subextension):
+        message = f"{file_path} already has a subtitle created for this, skipping it"
+    elif os.path.exists(file_path.rsplit('.', 1)[0] + subextensionSDH):
+        message = f"{file_path} already has a SDH subtitle created for this, skipping it"
+    if message != None:
+        logging.info(message)
+        return False
+    return True
 
 if monitor:
     # Define a handler class that will process new files
@@ -810,13 +873,16 @@ if monitor:
             if not event.is_directory:
                 file_path = event.src_path
                 if has_audio(file_path):
-                # Call the gen_subtitles function
+                    # Call the gen_subtitles function
                     logging.info(f"File: {path_mapping(file_path)} was added")
                     gen_subtitles(path_mapping(file_path), transcribe_or_translate, False)
+
         def on_created(self, event):
             self.create_subtitle(event)
+
         def on_modified(self, event):
             self.create_subtitle(event)
+
 
 def transcribe_existing(transcribe_folders, forceLanguage=None):
     transcribe_folders = transcribe_folders.split("|")
@@ -827,12 +893,15 @@ def transcribe_existing(transcribe_folders, forceLanguage=None):
         for root, dirs, files in os.walk(path):
             for file in files:
                 file_path = os.path.join(root, file)
-                add_to_queue(path_mapping(file_path), transcribe_or_translate, forceLanguage=forceLanguage)
+                if has_audio(file_path) and needsubs(path):
+                    task_queue.put((2, None, path_mapping(file_path), transcribe_or_translate, forceLanguage))
+                #gen_subtitles(path_mapping(file_path), transcribe_or_translate, False, forceLanguage)
     # if the path specified was actually a single file and not a folder, process it
     if os.path.isfile(path):
-        if has_audio(path):
-            add_to_queue(path_mapping(path), transcribe_or_translate, forceLanguage=forceLanguage)
-     # Set up the observer to watch for new files
+        if has_audio(path) and needsubs(path):
+            #gen_subtitles(path_mapping(path), transcribe_or_translate, False, forceLanguage)
+            task_queue.put((2, None, path_mapping(path), transcribe_or_translate, forceLanguage))
+            # Set up the observer to watch for new files
     if monitor:
         observer = Observer()
         for path in transcribe_folders:
@@ -841,6 +910,7 @@ def transcribe_existing(transcribe_folders, forceLanguage=None):
                 observer.schedule(handler, path, recursive=True)
         observer.start()
         logging.info("Finished searching and queueing files for transcription. Now watching for new files.")
+
 
 whisper_languages = {
     "en": "english",
@@ -1047,54 +1117,106 @@ greetings_translations = {
 }
 
 env_variables = {
-    "TRANSCRIBE_DEVICE": {"description": "Can transcribe via gpu (Cuda only) or cpu. Takes option of 'cpu', 'gpu', 'cuda'.", "default": "cpu", "value": ""},
-    "WHISPER_MODEL": {"description": "Can be: 'tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1','large-v2', 'large-v3', 'large', 'distil-large-v2', 'distil-medium.en', 'distil-small.en'", "default": "medium", "value": ""},
-    "CONCURRENT_TRANSCRIPTIONS": {"description": "Number of files it will transcribe in parallel", "default": "2", "value": ""},
+    "TRANSCRIBE_DEVICE": {
+        "description": "Can transcribe via gpu (Cuda only) or cpu. Takes option of 'cpu', 'gpu', 'cuda'.",
+        "default": "cpu", "value": ""},
+    "WHISPER_MODEL": {
+        "description": "Can be: 'tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1','large-v2', 'large-v3', 'large', 'distil-large-v2', 'distil-medium.en', 'distil-small.en'",
+        "default": "medium", "value": ""},
+    "CONCURRENT_TRANSCRIPTIONS": {"description": "Number of files it will transcribe in parallel", "default": "2",
+                                  "value": ""},
     "WHISPER_THREADS": {"description": "Number of threads to use during computation", "default": "4", "value": ""},
-    "MODEL_PATH": {"description": "This is where the WHISPER_MODEL will be stored. This defaults to placing it where you execute the script in the folder 'models'", "default": "./models", "value": ""},
-    "PROCADDEDMEDIA": {"description": "Will gen subtitles for all media added regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)", "default": True, "value": ""},
-    "PROCMEDIAONPLAY": {"description": "Will gen subtitles for all played media regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)", "default": True, "value": ""},
-    "NAMESUBLANG": {"description": "Allows you to pick what it will name the subtitle. Instead of using EN, I'm using AA, so it doesn't mix with existing external EN subs, and AA will populate higher on the list in Plex.", "default": "aa", "value": ""},
-    "SKIPIFINTERNALSUBLANG": {"description": "Will not generate a subtitle if the file has an internal sub matching the 3 letter code of this variable", "default": "eng", "value": ""},
-    "WORD_LEVEL_HIGHLIGHT": {"description": "Highlights each word as it's spoken in the subtitle.", "default": False, "value": ""},
-    "PLEXSERVER": {"description": "This needs to be set to your local plex server address/port", "default": "http://plex:32400", "value": ""},
+    "MODEL_PATH": {
+        "description": "This is where the WHISPER_MODEL will be stored. This defaults to placing it where you execute the script in the folder 'models'",
+        "default": "./models", "value": ""},
+    "PROCADDEDMEDIA": {
+        "description": "Will gen subtitles for all media added regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)",
+        "default": True, "value": ""},
+    "PROCMEDIAONPLAY": {
+        "description": "Will gen subtitles for all played media regardless of existing external/embedded subtitles (based off of SKIPIFINTERNALSUBLANG)",
+        "default": True, "value": ""},
+    "NAMESUBLANG": {
+        "description": "Allows you to pick what it will name the subtitle. Instead of using EN, I'm using AA, so it doesn't mix with existing external EN subs, and AA will populate higher on the list in Plex.",
+        "default": "aa", "value": ""},
+    "SKIPIFINTERNALSUBLANG": {
+        "description": "Will not generate a subtitle if the file has an internal sub matching the 3 letter code of this variable",
+        "default": "eng", "value": ""},
+    "WORD_LEVEL_HIGHLIGHT": {"description": "Highlights each word as it's spoken in the subtitle.", "default": False,
+                             "value": ""},
+    "PLEXSERVER": {"description": "This needs to be set to your local plex server address/port",
+                   "default": "http://plex:32400", "value": ""},
     "PLEXTOKEN": {"description": "This needs to be set to your plex token", "default": "token here", "value": ""},
-    "JELLYFINSERVER": {"description": "Set to your Jellyfin server address/port", "default": "http://jellyfin:8096", "value": ""},
-    "JELLYFINTOKEN": {"description": "Generate a token inside the Jellyfin interface", "default": "token here", "value": ""},
-    "WEBHOOKPORT": {"description": "Change this if you need a different port for your webhook", "default": "9000", "value": ""},
-    "USE_PATH_MAPPING": {"description": "Similar to sonarr and radarr path mapping, this will attempt to replace paths on file systems that don't have identical paths. Currently only support for one path replacement.", "default": False, "value": ""},
-    "PATH_MAPPING_FROM": {"description": "This is the path of my media relative to my Plex server", "default": "/tv", "value": ""},
-    "PATH_MAPPING_TO": {"description": "This is the path of that same folder relative to my Mac Mini that will run the script", "default": "/Volumes/TV", "value": ""},
-    "TRANSCRIBE_FOLDERS": {"description": "Takes a pipe '|' separated list and iterates through and adds those files to be queued for subtitle generation if they don't have internal subtitles", "default": "", "value": ""},
-    "TRANSCRIBE_OR_TRANSLATE": {"description": "Takes either 'transcribe' or 'translate'. Transcribe will transcribe the audio in the same language as the input. Translate will transcribe and translate into English.", "default": "transcribe", "value": ""},
-    "COMPUTE_TYPE": {"description": "Set compute-type using the following information: https://github.com/OpenNMT/CTranslate2/blob/master/docs/quantization.md", "default": "auto", "value": ""},
-    "DEBUG": {"description": "Provides some debug data that can be helpful to troubleshoot path mapping and other issues. If set to true, any modifications to the script will auto-reload it (if it isn't actively transcoding). Useful to make small tweaks without re-downloading the whole file.", "default": True, "value": ""},
-    "FORCE_DETECTED_LANGUAGE_TO": {"description": "This is to force the model to a language instead of the detected one, takes a 2 letter language code.", "default": "", "value": ""},
-    "CLEAR_VRAM_ON_COMPLETE": {"description": "This will delete the model and do garbage collection when queue is empty. Good if you need to use the VRAM for something else.", "default": True, "value": ""},
-    "UPDATE": {"description": "Will pull latest subgen.py from the repository if True. False will use the original subgen.py built into the Docker image. Standalone users can use this with launcher.py to get updates.","default": False,"value": ""},
-    "APPEND": {"description": "Will add the following at the end of a subtitle: 'Transcribed by whisperAI with faster-whisper ({whisper_model}) on {datetime.now()}'","default": False,"value": ""},
-    "MONITOR": {"description": "Will monitor TRANSCRIBE_FOLDERS for real-time changes to see if we need to generate subtitles","default": False,"value": ""},
-    "USE_MODEL_PROMPT": {"description": "When set to True, will use the default prompt stored in greetings_translations 'Hello, welcome to my lecture.' to try and force the use of punctuation in transcriptions that don't.","default": False,"value": ""},
-    "CUSTOM_MODEL_PROMPT": {"description": "If USE_MODEL_PROMPT is True, you can override the default prompt (See: [prompt engineering in whisper](https://medium.com/axinc-ai/prompt-engineering-in-whisper-6bb18003562d%29) for great examples).","default": "","value": ""},
-    "LRC_FOR_AUDIO_FILES": {"description": "Will generate LRC (instead of SRT) files for filetypes: '.mp3', '.flac', '.wav', '.alac', '.ape', '.ogg', '.wma', '.m4a', '.m4b', '.aac', '.aiff'","default": True,"value": ""},
-    "CUSTOM_REGROUP": {"description": "Attempts to regroup some of the segments to make a cleaner looking subtitle. See #68 for discussion. Set to blank if you want to use Stable-TS default regroups algorithm of cm_sp=,* /，_sg=.5_mg=.3+3_sp=.* /。/?/？","default": "cm_sl=84_sl=42++++++1","value": ""}
+    "JELLYFINSERVER": {"description": "Set to your Jellyfin server address/port", "default": "http://jellyfin:8096",
+                       "value": ""},
+    "JELLYFINTOKEN": {"description": "Generate a token inside the Jellyfin interface", "default": "token here",
+                      "value": ""},
+    "WEBHOOKPORT": {"description": "Change this if you need a different port for your webhook", "default": "9000",
+                    "value": ""},
+    "USE_PATH_MAPPING": {
+        "description": "Similar to sonarr and radarr path mapping, this will attempt to replace paths on file systems that don't have identical paths. Currently only support for one path replacement.",
+        "default": False, "value": ""},
+    "PATH_MAPPING_FROM": {"description": "This is the path of my media relative to my Plex server", "default": "/tv",
+                          "value": ""},
+    "PATH_MAPPING_TO": {
+        "description": "This is the path of that same folder relative to my Mac Mini that will run the script",
+        "default": "/Volumes/TV", "value": ""},
+    "TRANSCRIBE_FOLDERS": {
+        "description": "Takes a pipe '|' separated list and iterates through and adds those files to be queued for subtitle generation if they don't have internal subtitles",
+        "default": "", "value": ""},
+    "TRANSCRIBE_OR_TRANSLATE": {
+        "description": "Takes either 'transcribe' or 'translate'. Transcribe will transcribe the audio in the same language as the input. Translate will transcribe and translate into English.",
+        "default": "transcribe", "value": ""},
+    "COMPUTE_TYPE": {
+        "description": "Set compute-type using the following information: https://github.com/OpenNMT/CTranslate2/blob/master/docs/quantization.md",
+        "default": "auto", "value": ""},
+    "DEBUG": {
+        "description": "Provides some debug data that can be helpful to troubleshoot path mapping and other issues. If set to true, any modifications to the script will auto-reload it (if it isn't actively transcoding). Useful to make small tweaks without re-downloading the whole file.",
+        "default": True, "value": ""},
+    "FORCE_DETECTED_LANGUAGE_TO": {
+        "description": "This is to force the model to a language instead of the detected one, takes a 2 letter language code.",
+        "default": "", "value": ""},
+    "CLEAR_VRAM_ON_COMPLETE": {
+        "description": "This will delete the model and do garbage collection when queue is empty. Good if you need to use the VRAM for something else.",
+        "default": True, "value": ""},
+    "UPDATE": {
+        "description": "Will pull latest subgen.py from the repository if True. False will use the original subgen.py built into the Docker image. Standalone users can use this with launcher.py to get updates.",
+        "default": False, "value": ""},
+    "APPEND": {
+        "description": "Will add the following at the end of a subtitle: 'Transcribed by whisperAI with faster-whisper ({whisper_model}) on {datetime.now()}'",
+        "default": False, "value": ""},
+    "MONITOR": {
+        "description": "Will monitor TRANSCRIBE_FOLDERS for real-time changes to see if we need to generate subtitles",
+        "default": False, "value": ""},
+    "USE_MODEL_PROMPT": {
+        "description": "When set to True, will use the default prompt stored in greetings_translations 'Hello, welcome to my lecture.' to try and force the use of punctuation in transcriptions that don't.",
+        "default": False, "value": ""},
+    "CUSTOM_MODEL_PROMPT": {
+        "description": "If USE_MODEL_PROMPT is True, you can override the default prompt (See: [prompt engineering in whisper](https://medium.com/axinc-ai/prompt-engineering-in-whisper-6bb18003562d%29) for great examples).",
+        "default": "", "value": ""},
+    "LRC_FOR_AUDIO_FILES": {
+        "description": "Will generate LRC (instead of SRT) files for filetypes: '.mp3', '.flac', '.wav', '.alac', '.ape', '.ogg', '.wma', '.m4a', '.m4b', '.aac', '.aiff'",
+        "default": True, "value": ""},
+    "CUSTOM_REGROUP": {
+        "description": "Attempts to regroup some of the segments to make a cleaner looking subtitle. See #68 for discussion. Set to blank if you want to use Stable-TS default regroups algorithm of cm_sp=,* /，_sg=.5_mg=.3+3_sp=.* /。/?/？",
+        "default": "cm_sl=84_sl=42++++++1", "value": ""}
 }
 
 if __name__ == "__main__":
     import uvicorn
+
     update_env_variables()
-    
-    for _ in range(concurrent_transcriptions):
-        thread = threading.Thread(target=worker)
-        thread.daemon = True  # Daemon threads will shut down when the main thread exits
-        thread.start()
-    
-    logging.info(f"Subgen v{subgen_version}")
-    logging.info("Starting Subgen with listening webhooks!")
-    logging.info(f"Transcriptions are limited to running {str(concurrent_transcriptions)} at a time")
-    logging.info(f"Running {str(whisper_threads)} threads per transcription")
-    logging.info(f"Using {transcribe_device} to encode")
-    logging.info(f"Using faster-whisper")
-    if transcribe_folders:
-        transcribe_existing(transcribe_folders)
-    uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)
+
+    # Start worker threads
+    for _ in range(CONCURRENT_TASKS):
+        thread = Thread(target=worker, daemon=True)
+    thread.start()
+
+logging.info(f"Subgen v{subgen_version}")
+logging.info("Starting Subgen with listening webhooks!")
+logging.info(f"Transcriptions are limited to running {str(concurrent_transcriptions)} at a time")
+logging.info(f"Running {str(whisper_threads)} threads per transcription")
+logging.info(f"Using {transcribe_device} to encode")
+logging.info(f"Using faster-whisper")
+if transcribe_folders:
+    transcribe_existing(transcribe_folders)
+uvicorn.run("__main__:app", host="0.0.0.0", port=int(webhookport), reload=reload_script_on_change, use_colors=True)
