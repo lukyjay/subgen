@@ -1,4 +1,4 @@
-subgen_version = '2024.3.25.62'
+subgen_version = '2024.3.26.65'
 
 from datetime import datetime
 import subprocess
@@ -6,7 +6,7 @@ import os
 import json
 import xml.etree.ElementTree as ET
 import threading
-from threading import Semaphore
+from threading import Semaphore, Thread
 import sys
 import time
 import queue
@@ -94,15 +94,12 @@ def update_env_variables():
     lrc_for_audio_files = convert_to_bool(os.getenv('LRC_FOR_AUDIO_FILES', True))
     custom_regroup = os.getenv('CUSTOM_REGROUP', 'cm_sl=84_sl=42++++++1')
 
+    set_env_variables('subgen.env')
+    
     if transcribe_device == "gpu":
         transcribe_device = "cuda"
 
-    set_env_variables('subgen.env')
-
 update_env_variables()
-
-# Create a semaphore with the maximum number of concurrent transcriptions
-semaphore = Semaphore(concurrent_transcriptions)
 
 if monitor:
     from watchdog.observers.polling import PollingObserver as Observer
@@ -217,34 +214,22 @@ def form_get():
     html_content += "<html><body><form action=\"/submit\" method=\"post\">"
     
     for var_name, var_info in env_variables.items():
-        # First, check if the variable is set in the OS environment
-        os_value = os.getenv(var_name)
-        # If not, use the value from the .env file
-        if os_value is None:
-            os_value = env_values.get(var_name, '')
-        # Convert the value to a boolean if necessary
-        value_bool = convert_to_bool(os_value) if isinstance(var_info['default'], bool) else os_value
+        value = os.getenv(var_name, env_values.get(var_name, var_info['default'])) if not isinstance(var_info['default'], bool) else convert_to_bool(os.getenv(var_name, env_values.get(var_name, var_info['default'])))
         # Generate the HTML content
         html_content += f"<br><div><strong>{var_name}</strong>: {var_info['description']} (<strong>default: {var_info['default']}</strong>)<br>"
         if var_name == "TRANSCRIBE_OR_TRANSLATE":
-            selected_value = value_bool if value_bool in ['transcribe', 'translate'] else var_info['default']
             html_content += f"<select name=\"{var_name}\">"
-            html_content += f"<option value=\"transcribe\"{' selected' if selected_value == 'transcribe' else ''}>Transcribe</option>"
-            html_content += f"<option value=\"translate\"{' selected' if selected_value == 'translate' else ''}>Translate</option>"
+            html_content += f"<option value=\"transcribe\"{' selected' if value == 'transcribe' else ''}>Transcribe</option>"
+            html_content += f"<option value=\"translate\"{' selected' if value == 'translate' else ''}>Translate</option>"
             html_content += "</select><br>"
         elif isinstance(var_info['default'], bool):
-            if os.getenv(var_name):
-                env_value = os.getenv(var_name)
-            elif env_values.get(var_name):
-                env_value = env_values.get(var_name)
-            else:
-                env_value = var_info['default']
             html_content += f"<select name=\"{var_name}\">"
-            html_content += f"<option value=\"True\"{' selected' if env_value else ''}>True</option>"
-            html_content += f"<option value=\"False\"{' selected' if not env_value else ''}>False</option>"
+            html_content += f"<option value=\"True\"{' selected' if value else ''}>True</option>"
+            html_content += f"<option value=\"False\"{' selected' if not value else ''}>False</option>"
             html_content += "</select><br>"
         else:
-            html_content += f"<input type=\"text\" name=\"{var_name}\" value=\"{value_bool}\" placeholder=\"{var_info['default']}\" style=\"width: 200px;\"/></div>"
+            value = value if value != var_info['default'] else ''
+            html_content += f"<input type=\"text\" name=\"{var_name}\" value=\"{value}\" placeholder=\"{var_info['default']}\" style=\"width: 200px;\"/></div>"
 
     html_content += "<br><input type=\"submit\" value=\"Save as subgen.env and reload\"/></form></body></html>"
     return html_content
@@ -269,34 +254,29 @@ async def form_post(request: Request):
             existing_vars[var.strip()] = val.strip()
 
     # Update the file with new values from the form
-    with open(f"{env_path}", "w") as file:
+    with open(env_path, "w") as file:
         for key, value in form_data.items():
             # Normalize the key to uppercase
             key = key.upper()
             # Convert the value to the correct type (boolean or string)
-            if isinstance(env_variables[key]['default'], bool):
-                value = value.strip().lower() == 'true'
-            else:
-                value = value.strip()
-            # Write to file only if the value is different from the default
-            if env_variables[key]["default"] != value and value:
-                # Check if the variable already exists and if the value is different
-                if key in existing_vars and existing_vars[key] != str(value):
-                    # Update the existing variable with the new value
-                    existing_vars[key] = str(value)
-                elif key not in existing_vars:
-                    # Add the new variable to the dictionary
-                    existing_vars[key] = str(value)
-            elif key in existing_vars:
-                # Remove the entry from the existing variables if the value is empty
-                del existing_vars[key]
+            value = value.strip() if not isinstance(env_variables[key]["default"], bool) else convert_to_bool(value.strip())
+            # Retrieve the current environment variable value
+            env_value = os.getenv(key)
+            if key in os.environ:
                 del os.environ[key]
+            # Write to file only if the value is different from the os.getenv and has a value
+            if env_value != value and (value is not None and value != '') and (env_variables[key]["default"] != value):
+                # Update the existing variable with the new value
+                existing_vars[key] = str(value)
+                # Update the environment variable
+                os.environ[key] = str(value)
 
         # Write the updated variables to the file
         for var, val in existing_vars.items():
             file.write(f"{var}={val}\n")
+
     update_env_variables()
-    return(f"Configuration saved to {env_path}, reloading your subgen with your new values!")
+    return f"Configuration saved to {env_path}, reloading your subgen with your new values!"
 
 @app.get("/status")
 def status():
@@ -358,7 +338,7 @@ def receive_tautulli_webhook(
             fullpath = file
             logging.debug("Path of file: " + fullpath)
         
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
     else:
         return {"This doesn't appear to be a properly configured Tautulli webhook, please review the instructions again!"}
     
@@ -379,7 +359,7 @@ def receive_plex_webhook(
             fullpath = get_plex_file_name(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
             logging.debug("Path of file: " + fullpath)
      
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
             try:
                 refresh_plex_metadata(plex_json['Metadata']['ratingKey'], plexserver, plextoken)
                 logging.info(f"Metadata for item {plex_json['Metadata']['ratingKey']} refreshed successfully.")
@@ -405,7 +385,7 @@ def receive_jellyfin_webhook(
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
             logging.debug(f"Path of file: {fullpath}")
      
-            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate)
             try:
                 refresh_jellyfin_metadata(ItemId, jellyfinserver, jellyfintoken)
                 logging.info(f"Metadata for item {ItemId} refreshed successfully.")
@@ -432,7 +412,7 @@ def receive_emby_webhook(
             if((event == "library.new" and procaddedmedia) or (event == "playback.start" and procmediaonplay)):
                 logging.debug("Path of file: " + fullpath)
      
-                add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
+                add_to_queue(path_mapping(fullpath), transcribe_or_translate)
     else:
         return {"This doesn't appear to be a properly configured Emby webhook, please review the instructions again!"}
      
@@ -449,54 +429,35 @@ def batch(
 @app.post("//asr")
 @app.post("/asr")
 async def asr(
-        task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
-        language: Union[str, None] = Query(default=None),
-        initial_prompt: Union[str, None] = Query(default=None),  #not used by Bazarr
-        audio_file: UploadFile = File(...),
-        encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),  #not used by Bazarr/always False
-        output: Union[str, None] = Query(default="srt", enum=["txt", "vtt", "srt", "tsv", "json"]),
-        word_timestamps: bool = Query(default=False, description="Word level timestamps") #not used by Bazarr
+		task: Union[str, None] = Query(default="transcribe", enum=["transcribe", "translate"]),
+		language: Union[str, None] = Query(default=None),
+		initial_prompt: Union[str, None] = Query(default=None),  #not used by Bazarr
+		audio_file: UploadFile = File(...),
+		encode: bool = Query(default=True, description="Encode audio first through ffmpeg"),  #not used by Bazarr/always False
+		output: Union[str, None] = Query(default="srt", enum=["txt", "vtt", "srt", "tsv", "json"]),
+		word_timestamps: bool = Query(default=False, description="Word level timestamps") #not used by Bazarr
 ):
-    try:
-        logging.debug(f"Received file from Bazarr/ASR webhook")
-        result = None
-        #random_name = random.choices("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890", k=6)
-        
-        #start_time = time.time()
-        #start_model()
-        #files_to_transcribe.insert(0, f"Bazarr-asr-{random_name}")
-        
-        
-        audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
-        
-        result = await add_to_queue(file_path=audio_data, transcribe_or_translate=task, forceLanguage=language, bazarr=True, priority=1)
-        
-        #if model_prompt:
-        #    custom_model_prompt = greetings_translations.get(language, '') or custom_model_prompt
-        #if custom_regroup:
-        #    result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-        #else:
-        #    result = model.transcribe_stable(audio_data, task=task, input_sr=16000, language=language, progress_callback=progress, initial_prompt=custom_model_prompt)
-        #appendLine(result)
-        #elapsed_time = time.time() - start_time
-        #minutes, seconds = divmod(int(elapsed_time), 60)
-        #logging.info(f"Bazarr transcription is completed, it took {minutes} minutes and {seconds} seconds to complete.")
-    except Exception as e:
-        logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
-    #finally:
-        #if f"Bazarr-asr-{random_name}" in files_to_transcribe:
-            #files_to_transcribe.remove(f"Bazarr-asr-{random_name}")
-        #delete_model()
-    if result:
-        return StreamingResponse(
-            iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
-            media_type="text/plain",
-            headers={
-                'Source': 'Transcribed using stable-ts from Subgen!',
-            })
-    else:
-        return
+	try:
+		logging.debug(f"Received file from Bazarr/ASR webhook")
+		result = None
+		
+		audio_data = np.frombuffer(audio_file.file.read(), np.int16).flatten().astype(np.float32) / 32768.0
+		
+		result_queue = add_to_queue(file_path=audio_data, transcribe_or_translate=task, forceLanguage=language, bazarr=True, priority=1)
+		result = result_queue.get()
+	except Exception as e:
+		logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
 
+	if result:
+		return StreamingResponse(
+			iter(result.to_srt_vtt(filepath = None, word_level=word_level_highlight)),
+			media_type="text/plain",
+			headers={
+				'Source': 'Transcribed using stable-ts from Subgen!',
+			})
+	else:
+		return
+        
 @app.post("//detect-language")
 @app.post("/detect-language")
 def detect_language(
@@ -513,8 +474,13 @@ def detect_language(
             
     except Exception as e:
         logging.info(f"Error processing or transcribing Bazarr {audio_file.filename}: {e}")
+        
+    finally:
+        if f"Bazarr-detect-language-{random_name}" in files_to_transcribe:
+            files_to_transcribe.remove(f"Bazarr-detect-language-{random_name}")
+        delete_model()
 
-    return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code) , "language_code": detected_lang_code}
+        return {"detected_language": whisper_languages.get(detected_lang_code, detected_lang_code) , "language_code": detected_lang_code}
 
 def start_model():
     global model
@@ -541,60 +507,82 @@ def write_lrc(result, file_path):
             file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}] {segment.text}\n")
 
 def worker():
-    while True:
-        # Get the next task from the priority queue
-        priority, file_path, transcribe_or_translate, forceLanguage, bazarr = transcription_queue.get()
-        try:
-            with semaphore:
-                start_time = time.time()
-                if bazarr:
-                    gen_subtitles_asr(file_path, transcribe_or_translate, forceLanguage=forceLanguage)
-                else:
-                    gen_subtitles(file_path, transcribe_or_translate, forceLanguage=forceLanguage)
-                elapsed_time = time.time() - start_time
-                minutes, seconds = divmod(int(elapsed_time), 60)
-                if not bazarr:
-                    logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
-                else:
-                    logging.info(f"Transcription of Bazarr/ASR is completed, it took {minutes} minutes and {seconds} seconds to complete.")
-        finally:
-            # Signal that the task is done
-            transcription_queue.task_done()
-            logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
-
+	while True:
+		# Get the next task from the priority queue
+		priority, file_path, transcribe_or_translate, forceLanguage, bazarr = transcription_queue.get()
+		try:
+			with semaphore:
+				start_time = time.time()
+				result_queue = add_to_queue(file_path, transcribe_or_translate, forceLanguage, bazarr, priority)
+				result = result_queue.get()  # This will block until the result is available
+				elapsed_time = time.time() - start_time
+				minutes, seconds = divmod(int(elapsed_time), 60)
+				if not bazarr:
+					logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+				else:
+					logging.info(f"Transcription of Bazarr/ASR is completed, it took {minutes} minutes and {seconds} seconds to complete.")
+		finally:
+			# Signal that the task is done
+			transcription_queue.task_done()
+			logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
+			
+# Function to add a task to the transcription queue
 def add_to_queue(file_path, transcribe_or_translate, forceLanguage, bazarr=False, priority=2):
-    # Create a task tuple with all the necessary information
-    task = (priority, file_path, transcribe_or_translate, forceLanguage, bazarr)
-    
-    # Add the task tuple to the queue with the given priority
-    if not bazarr:
-        logging.info(f"Added {os.path.basename(file_path)} for transcription.")
-    else:
-        logging.info(f"Added Bazarr/ASR for transcription.")
-    transcription_queue.put(task)  # Pass the entire task as a single tuple
-    logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
+	# Create a task tuple with all the necessary information
+	task = (priority, file_path, transcribe_or_translate, forceLanguage, bazarr)
+	result_queue = queue.Queue()
+	event = threading.Event()  # Event to signal completion of the task
+	
+	# Define a wrapper function to run the task and store the result
+	def task_wrapper():
+		try:
+			if bazarr:
+				result = gen_subtitles_asr(file_path, transcribe_or_translate, forceLanguage)
+			else:
+				result = gen_subtitles(file_path, transcribe_or_translate, forceLanguage)
+				print("doing gen_subs")
+			result_queue.put(result)
+		finally:
+			event.set()  # Signal that the task is completed
+	
+	# Start the task in a new thread
+	task_thread = threading.Thread(target=task_wrapper)
+	task_thread.start()
+	
+	# Wait for the task to complete
+	event.wait()
+	
+	# Add the task tuple to the queue with the given priority
+	if not bazarr:
+		logging.info(f"Added {os.path.basename(file_path)} for transcription.")
+	else:
+		logging.info(f"Added Bazarr/ASR for transcription.")
+	transcription_queue.put(task)  # Pass the entire task as a single tuple
+	logging.info(f"{transcription_queue.qsize()} files in the queue for transcription")
+	
+	return result_queue
 
-async def gen_subtitles_asr(audio, transcribe_or_translate: str, forceLanguage=None):
-    """Generates subtitles for a video file.
+def gen_subtitles_asr(audio, transcribe_or_translate: str, forceLanguage=None):
+	"""Generates subtitles for a video file.
 
-    Args:
-        audio: The audio provided
-        transcribe_or_translate: str - The type of transcription or translation to perform.
-        forceLanguage: str - The language to force for transcription or translation. Default is None.
-    """
-    try:
-        start_model()
-        if custom_regroup:
-            result = await model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
-        else:
-            result = await model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt)
+	Args:
+		audio: The audio provided
+		transcribe_or_translate: str - The type of transcription or translation to perform.
+		forceLanguage: str - The language to force for transcription or translation. Default is None.
+	"""
+	try:
+		start_model()
+		if custom_regroup:
+			result = model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt, regroup=custom_regroup)
+		else:
+			result = model.transcribe_stable(audio, language=forceLanguage, task=transcribe_or_translate, input_sr=16000, progress_callback=progress, initial_prompt=custom_model_prompt)
 
-        appendLine(result)
-    except Exception as e:
-        logging.info(f"Error processing or transcribing {file_path}: {e}")
-    finally:
-        delete_model()
-        return result
+		appendLine(result)
+	except Exception as e:
+		logging.info(f"Error processing or transcribing {file_path}: {e}")
+	finally:
+		delete_model()
+		return result
 
 
 def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forceLanguage=None) -> None:
@@ -624,9 +612,16 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
                 logging.info(message)
                 return message
                 
-            files_to_transcribe.append(file_path)
+            if front:
+                files_to_transcribe.insert(0, file_path)
+            else:
+                files_to_transcribe.append(file_path)
+            logging.info(f"Added {os.path.basename(file_path)} for transcription.")
+            # Start transcription for the file in a separate thread
 
+            logging.info(f"{len(files_to_transcribe)} files in the queue for transcription")
             logging.info(f"Transcribing file: {os.path.basename(file_path)}")
+            start_time = time.time()
             start_model()
             global force_detected_language_to
             if force_detected_language_to:
@@ -642,6 +637,9 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
                 write_lrc(result, file_name + '.lrc')
             else:
                 result.to_srt_vtt(file_name + subextension, word_level=word_level_highlight)
+            elapsed_time = time.time() - start_time
+            minutes, seconds = divmod(int(elapsed_time), 60)
+            logging.info(f"Transcription of {os.path.basename(file_path)} is completed, it took {minutes} minutes and {seconds} seconds to complete.")
         else:
             logging.info(f"File {os.path.basename(file_path)} is already in the transcription list. Skipping.")
 
@@ -651,7 +649,7 @@ def gen_subtitles(file_path: str, transcribe_or_translate: str, front=True, forc
         if file_path in files_to_transcribe:
             files_to_transcribe.remove(file_path)
         delete_model()
-        
+
 def get_file_name_without_extension(file_path):
     file_name, file_extension = os.path.splitext(file_path)
     return file_name
@@ -822,7 +820,7 @@ if monitor:
                 if has_audio(file_path):
                 # Call the gen_subtitles function
                     logging.info(f"File: {path_mapping(file_path)} was added")
-                    add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=None)
+                    gen_subtitles(path_mapping(file_path), transcribe_or_translate, False)
         def on_created(self, event):
             self.create_subtitle(event)
         def on_modified(self, event):
@@ -837,11 +835,11 @@ def transcribe_existing(transcribe_folders, forceLanguage=None):
         for root, dirs, files in os.walk(path):
             for file in files:
                 file_path = os.path.join(root, file)
-                add_to_queue(path_mapping(file_path), transcribe_or_translate, forceLanguage=forceLanguage)
+                add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=forceLanguage)
     # if the path specified was actually a single file and not a folder, process it
     if os.path.isfile(path):
         if has_audio(path):
-            add_to_queue(path_mapping(path), transcribe_or_translate, forceLanguage=forceLanguage)
+            add_to_queue(path_mapping(fullpath), transcribe_or_translate, forceLanguage=forceLanguage)
      # Set up the observer to watch for new files
     if monitor:
         observer = Observer()
@@ -1095,9 +1093,9 @@ if __name__ == "__main__":
     update_env_variables()
     
     for _ in range(concurrent_transcriptions):
-        thread = threading.Thread(target=worker)
-        thread.daemon = True  # Daemon threads will shut down when the main thread exits
-        thread.start()
+		thread = threading.Thread(target=worker)
+		thread.daemon = True  # Daemon threads will shut down when the main thread exits
+		thread.start()
     
     logging.info(f"Subgen v{subgen_version}")
     logging.info("Starting Subgen with listening webhooks!")
